@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "save page",
+  "version": "1.0",
+  "description": "save a web page as mhtml and save all images",
+  "permissions": ["tabs", "downloads", "pageCapture", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "save"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
