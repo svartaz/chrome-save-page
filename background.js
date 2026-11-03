@@ -1,107 +1,132 @@
-const escapeFilename = (name) =>
-  name.replace(/[\\?%*:|"<>`]/g, (it) => "`" + it.charCodeAt().toString(16));
+const ROOT = "space.sumi.save";
 
-const loadImages = async (tab) => {
-  const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: async () => {
-      const scrollHeight = document.body.scrollHeight;
-      const height = window.innerHeight;
-      for (let i = 0; i < Math.ceil(scrollHeight / height); i++) {
-        window.scrollTo(0, i * height);
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      }
-      window.scrollTo(0, 0);
-    },
-  });
-  await result;
+// Characters Chrome rejects in download filenames, plus "&", ";" and "%" so the
+// escaping stays unambiguous.
+const FILENAME_ESCAPES = {
+  "&": "&amp;",
+  ";": "&semi;",
+  "\\": "&bsol;",
+  "?": "&quest;",
+  "%": "&percnt;",
+  "*": "&ast;",
+  ":": "&colon;",
+  "|": "&vert;",
+  '"': "&quot;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "`": "&grave;",
 };
 
-const saveMhtml = async (tab) => {
-  const date = new Date().toISOString().replace(/-|T|:|\..+/g, "");
-  console.log("mhtml", date, tab.url);
+const MIME_BY_EXTENSION = {
+  png: "image/png",
+  gif: "image/gif",
+  svg: "image/svg+xml",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  webp: "image/webp",
+  apng: "image/apng",
+  bmp: "image/bmp",
+  ico: "image/vnd.microsoft.icon",
+  tiff: "image/tiff",
+  tif: "image/tiff",
+};
 
-  const blob = await chrome.pageCapture.saveAsMHTML({ tabId: tab.id });
-  const url = await new Promise((resolve, reject) => {
+// "https://a.com/b/c?d" -> "a.com/b/c&quest;d". "/" stays a directory
+// separator; empty segments (e.g. from a trailing slash) are dropped because
+// Chrome rejects them.
+const urlToPath = (url) =>
+  url
+    .replace(/^https?:\/\//, "")
+    .replace(/[&;\\?%*:|"<>`]/g, (c) => FILENAME_ESCAPES[c])
+    .split("/")
+    .filter(Boolean)
+    .join("/");
+
+const timestamp = () => new Date().toISOString().replace(/-|T|:|\..+/g, "");
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Service workers have no URL.createObjectURL, so downloads go through data URLs.
+const blobToDataUrl = (blob) =>
+  new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onloadend = () => resolve(reader.result);
+    reader.onload = () => resolve(reader.result);
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(blob);
   });
 
-  chrome.downloads.download({
-    url,
-    filename: `space.sumi.save/mhtml/${escapeFilename(
-      tab.url.replace(/^https?:\/\//, "")
-    )}/${date}.mhtml`,
+// Scroll through the page so lazy-loaded images are fetched before capture.
+const loadImages = (tab) =>
+  chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: async () => {
+      const { scrollX, scrollY, innerHeight: step } = window;
+      if (!step) return;
+      // Measured once on purpose: re-reading it would never end on infinite-scroll pages.
+      const height = document.documentElement.scrollHeight;
+      for (let y = 0; y < height; y += step) {
+        window.scrollTo(0, y);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      window.scrollTo(scrollX, scrollY);
+    },
+  });
+
+const saveMhtml = async (tab) => {
+  const filename = `${ROOT}/mhtml/${urlToPath(tab.url)}/${timestamp()}.mhtml`;
+  console.log("mhtml", filename);
+
+  const blob = await chrome.pageCapture.saveAsMHTML({ tabId: tab.id });
+  await chrome.downloads.download({ url: await blobToDataUrl(blob), filename });
+};
+
+const collectImageUrls = async (tab) => {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    // currentSrc is the candidate the browser actually picked from srcset/<picture>.
+    func: () => [...document.images].map((img) => img.currentSrc || img.src),
+  });
+  return [...new Set(result)].filter((src) => /^https?:/.test(src));
+};
+
+const saveImage = async (src) => {
+  const response = await fetch(src, { credentials: "include" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  let blob = await response.blob();
+
+  // Prefer the type implied by the URL's extension so content matches the filename.
+  const extension = new URL(src).pathname.match(/\.(\w+)$/)?.[1].toLowerCase();
+  const type = MIME_BY_EXTENSION[extension];
+  console.log("image", type, blob.type, src);
+  if (type && type !== blob.type) blob = new Blob([blob], { type });
+
+  await chrome.downloads.download({
+    url: await blobToDataUrl(blob),
+    filename: `${ROOT}/image/${urlToPath(src)}`,
+    conflictAction: "overwrite",
   });
 };
 
 const saveImages = async (tab) => {
-  const [{ result: srcs }] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: () =>
-      [...document.querySelectorAll("img")].flatMap(
-        (img) => [img.src] ?? img.srcset.split(",")
-      ),
-  });
-
-  for (const src of [...new Set(srcs)]) {
-    // avoid rate limit
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    if (src.startsWith("http")) {
-      const response = await fetch(src, {
-        referrer: tab.url,
-        "User-Agent": navigator.userAgent,
-        credentials: "include",
-      });
-      const blob = await response.blob();
-
-      const extension = src.replace(/\?.+/, "").match(/(?<=\.)\w+$/)?.[0];
-      const contentType = extension
-        ? {
-            png: "image/png",
-            gif: "image/gif",
-            svg: "image/svg+xml",
-            jpeg: "image/jpeg",
-            jpg: "image/jpeg",
-            webp: "image/webp",
-            apng: "image/apng",
-            bmp: "image/bmp",
-            ico: "image/vnd.microsoft.icon",
-            tiff: "image/tiff",
-            tif: "image/tiff",
-          }[extension]
-        : undefined;
-
-      console.log("image", contentType, blob.type, src);
-      if (contentType && !blob.type.startsWith(contentType)) {
-        const result = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = () => reject(reader.error);
-          reader.readAsDataURL(blob);
-        });
-
-        chrome.downloads.download({
-          url: `data:${contentType ?? blob.type};base64,${
-            result.split(",")[1]
-          }`,
-          filename: `space.sumi.save/image/${escapeFilename(
-            src.replace(/^https?:\/\//, "")
-          )}`,
-          conflictAction: "overwrite",
-        });
-      }
+  for (const src of await collectImageUrls(tab)) {
+    await sleep(200); // avoid rate limit
+    try {
+      await saveImage(src);
+    } catch (error) {
+      console.error("image failed", src, error);
     }
   }
 };
 
 const save = async (tab) => {
+  console.log("save", tab.url);
   await loadImages(tab);
-  saveMhtml(tab);
-  saveImages(tab);
+  const results = await Promise.allSettled([saveMhtml(tab), saveImages(tab)]);
+  for (const { status, reason } of results) {
+    if (status === "rejected") console.error(reason);
+  }
 };
 
-chrome.action.onClicked.addListener(save);
+chrome.action.onClicked.addListener((tab) =>
+  save(tab).catch((error) => console.error("save failed", tab.url, error))
+);

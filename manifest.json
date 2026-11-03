@@ -7,12 +7,11 @@
     "tabs",
     "downloads",
     "pageCapture",
-    "scripting",
-    "webRequest",
-    "webRequestBlocking",
+    "scripting"
+  ],
+  "host_permissions": [
     "<all_urls>"
   ],
-  "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "save"
   },
